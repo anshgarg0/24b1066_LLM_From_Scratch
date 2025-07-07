@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
-
+import numpy as np
 class GPTDatasetV1(Dataset):
 
     def __init__(self, text, tokenizer, max_length, stride):
@@ -132,3 +132,68 @@ def text_generater(model, text_data : torch.Tensor, context_size, max_new_tokens
         text_data = torch.cat((text_data, generated_tokens), dim = 1)
     
     return text_data
+
+def assign(left, right):
+    if left.shape != right.shape:
+        raise ValueError("Shapes no equal")
+    return torch.nn.Parameter(torch.tensor(right))
+
+def load_weights_into_gpt(gpt, params):
+    gpt.positional_emb.weight = assign(gpt.positional_emb.weight, params['wpe'])
+    gpt.token_emb.weight = assign(gpt.token_emb.weight, params['wte'])
+    
+    for b in range(len(params["blocks"])):
+        q_w, k_w, v_w = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["w"], 3, axis=-1)
+        gpt.transformer_blocks[b].attention_block.W_query.weight = assign(
+            gpt.transformer_blocks[b].attention_block.W_query.weight, q_w.T)
+        gpt.transformer_blocks[b].attention_block.W_key.weight = assign(
+            gpt.transformer_blocks[b].attention_block.W_key.weight, k_w.T)
+        gpt.transformer_blocks[b].attention_block.W_value.weight = assign(
+            gpt.transformer_blocks[b].attention_block.W_value.weight, v_w.T)
+
+        q_b, k_b, v_b = np.split(
+            (params["blocks"][b]["attn"]["c_attn"])["b"], 3, axis=-1)
+        gpt.transformer_blocks[b].attention_block.W_query.bias = assign(
+            gpt.transformer_blocks[b].attention_block.W_query.bias, q_b)
+        gpt.transformer_blocks[b].attention_block.W_key.bias = assign(
+            gpt.transformer_blocks[b].attention_block.W_key.bias, k_b)
+        gpt.transformer_blocks[b].attention_block.W_value.bias = assign(
+            gpt.transformer_blocks[b].attention_block.W_value.bias, v_b)
+
+        gpt.transformer_blocks[b].attention_block.out_proj.weight = assign(
+            gpt.transformer_blocks[b].attention_block.out_proj.weight, 
+            params["blocks"][b]["attn"]["c_proj"]["w"].T)
+        gpt.transformer_blocks[b].attention_block.out_proj.bias = assign(
+            gpt.transformer_blocks[b].attention_block.out_proj.bias, 
+            params["blocks"][b]["attn"]["c_proj"]["b"])
+
+        gpt.transformer_blocks[b].ffn.op_pipeline[0].weight = assign(
+            gpt.transformer_blocks[b].ffn.op_pipeline[0].weight, 
+            params["blocks"][b]["mlp"]["c_fc"]["w"].T)
+        gpt.transformer_blocks[b].ffn.op_pipeline[0].bias = assign(
+            gpt.transformer_blocks[b].ffn.op_pipeline[0].bias, 
+            params["blocks"][b]["mlp"]["c_fc"]["b"])
+        gpt.transformer_blocks[b].ffn.op_pipeline[2].weight = assign(
+            gpt.transformer_blocks[b].ffn.op_pipeline[2].weight, 
+            params["blocks"][b]["mlp"]["c_proj"]["w"].T)
+        gpt.transformer_blocks[b].ffn.op_pipeline[2].bias = assign(
+            gpt.transformer_blocks[b].ffn.op_pipeline[2].bias, 
+            params["blocks"][b]["mlp"]["c_proj"]["b"])
+
+        gpt.transformer_blocks[b].norm1.scale = assign(
+            gpt.transformer_blocks[b].norm1.scale, 
+            params["blocks"][b]["ln_1"]["g"])
+        gpt.transformer_blocks[b].norm1.shift = assign(
+            gpt.transformer_blocks[b].norm1.shift, 
+            params["blocks"][b]["ln_1"]["b"])
+        gpt.transformer_blocks[b].norm2.scale = assign(
+            gpt.transformer_blocks[b].norm2.scale, 
+            params["blocks"][b]["ln_2"]["g"])
+        gpt.transformer_blocks[b].norm2.shift = assign(
+            gpt.transformer_blocks[b].norm2.shift, 
+            params["blocks"][b]["ln_2"]["b"])
+
+    gpt.final_norm.scale = assign(gpt.final_norm.scale, params["g"])
+    gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
+    gpt.out_layer.weight = assign(gpt.out_layer.weight, params["wte"])
