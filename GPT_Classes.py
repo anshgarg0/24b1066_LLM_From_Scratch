@@ -4,6 +4,14 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import tiktoken
 import numpy as np
+
+def text_to_tokens(text, tokeniser: tiktoken.Encoding):
+    tokens = tokeniser.encode(text, allowed_special={"|<endoftext>|"})
+    return torch.tensor(tokens).unsqueeze(0)
+
+def tokens_to_text(tokens : torch.Tensor, tokeniser: tiktoken.Encoding):
+    return tokeniser.decode(tokens.squeeze(0).tolist())
+
 class GPTDatasetV1(Dataset):
 
     def __init__(self, text, tokenizer, max_length, stride):
@@ -197,3 +205,168 @@ def load_weights_into_gpt(gpt, params):
     gpt.final_norm.scale = assign(gpt.final_norm.scale, params["g"])
     gpt.final_norm.shift = assign(gpt.final_norm.shift, params["b"])
     gpt.out_layer.weight = assign(gpt.out_layer.weight, params["wte"])
+
+device = torch.device("cuda")
+
+def calc_loss_1(inputs : torch.Tensor, expected_outputs, model):
+    inputs, expected_outputs = inputs.to(device), expected_outputs.to(device)
+    logits = model(inputs)
+    return torch.nn.functional.cross_entropy(logits.flatten(0,1), expected_outputs.flatten(0))
+
+def calc_loss_loader(dataloader, model, num_batches = None):
+    total_loss = 0
+    if len(dataloader)==0:
+        return total_loss
+    elif num_batches==None:
+        num_batches = len(dataloader)
+    else:
+        num_batches = min(len(dataloader), num_batches)
+    for i, (inputs, targets) in enumerate(dataloader):
+        if i<num_batches:
+            total_loss+=calc_loss_1(inputs, targets, model).item()
+        else:
+            break
+
+    return total_loss/num_batches
+
+def calc_loss(input_msg, targets, model, device):
+    input_msg, targets = input_msg.to(device), targets.to(device)
+    logits = model(input_msg)
+    loss = torch.nn.functional.cross_entropy(logits[:,-1,:], targets)
+    return loss
+
+def calculate_accuracy(loader, model, device, num_batches=None):
+    model.to(device)
+    model.eval()
+    if len(loader) == 0:
+        return
+    elif num_batches == None:
+        num_batches = len(loader)
+    else:
+        num_batches = min(num_batches, len(loader))
+
+    total_messages_seen, correct_classifications = 0, 0
+    for j, (inputs, targets) in enumerate(loader):
+        if j<num_batches:
+            inputs, targets = inputs.to(device), targets.to(device)
+            total_messages_seen += inputs.shape[0]
+            with torch.no_grad():
+                correct_classifications += (torch.argmax(model(inputs)[:, -1, :], dim = -1) == targets).sum().item()
+        else:
+            break
+    model.train()
+    return correct_classifications/total_messages_seen
+
+def train_loop(train_loader, val_loader, model, device, num_epochs, optimiser : torch.optim.AdamW, val_freq, eval_iter):
+    model.train()
+    model.to(device)
+    num_batches = len(train_loader)
+    
+    batches_seen = -1
+    messages_seen_yet = 0
+    train_losses, val_losses, train_acc, val_acc, messages_seen = [], [], [], [], []
+    for i in range(num_epochs):
+        for j, (inputs, targets) in enumerate(train_loader):
+            if j < num_batches:
+                optimiser.zero_grad()
+                loss = calc_loss(inputs, targets, model, device)
+                loss.backward()
+                optimiser.step()
+
+                batches_seen += 1
+                messages_seen_yet += len(inputs)
+            else:
+                break
+
+            if batches_seen % val_freq == 0:
+                with torch.no_grad():
+                    train_loss = evaluate_model(model, train_loader, device, eval_iter)
+                    train_losses.append(train_loss)
+                    val_loss = evaluate_model(model, val_loader, device, eval_iter)
+                    val_losses.append(val_loss)
+                    messages_seen.append(messages_seen_yet)
+                print(f"Epoch {i}, Batch {batches_seen}, train_loss {train_loss}, val_loss {val_loss}")
+        train_acc.append(calculate_accuracy(train_loader, model, device, eval_iter))
+        val_acc.append(calculate_accuracy(val_loader, model, device, eval_iter))
+        print(f"Training accuracy: {train_acc[-1]*100:.2f}% | ", end="")
+        print(f"Validation accuracy: {val_acc[-1]*100:.2f}%")
+
+    return train_losses, val_losses, messages_seen, train_acc, val_acc
+
+def evaluate_model(model, loader, device, num_batches):
+    model.eval()
+    if len(loader) == 0:
+        return
+    elif num_batches == None:
+        num_batches = len(loader)
+    else:
+        num_batches = min(num_batches, len(loader))
+
+    total_loss = 0
+    for j, (inputs, targets) in enumerate(loader):
+        if j<num_batches:
+            total_loss += calc_loss(inputs, targets, model, device)
+        else:
+            break
+    model.train()
+    return total_loss/num_batches
+
+
+
+def training_function(model, dataloader_training, validating_dataset, num_epochs, optimiser : torch.optim.AdamW, device, eval_iter, sample, tokeniser):
+    model.to(device)
+    tokens_seen = 0
+    val_freq = 5
+    global_step = 0
+    train_losses, val_losses, track_tokens_seen = [],[],[]
+    for i in range(num_epochs):
+        model.train()
+        for inputs, targets in dataloader_training:
+            optimiser.zero_grad() #clear out previous gradients
+            loss = calc_loss_1(inputs, targets, model)
+            loss.backward()
+            optimiser.step()
+            tokens_seen += inputs.numel()
+            global_step += 1
+
+            if global_step%val_freq==0:
+                train_loss, valid_loss = evaluate_model_1(model, dataloader_training, validating_dataset, device, eval_iter)
+                train_losses.append(train_loss)
+                val_losses.append(valid_loss)
+                track_tokens_seen.append(tokens_seen)
+                print(f"Epoch: {i} Step: {global_step} Training loss: {train_loss} Validation Loss: {valid_loss} ")
+        model.eval()
+        print(tokens_to_text(text_generater(model, text_to_tokens(sample, tokeniser).to(device), 256, 50), tokeniser).replace('\n', " "))
+    return train_losses, val_losses, track_tokens_seen
+
+def evaluate_model_1(model, train_loader, val_loader, device, eval_iter):
+    model.eval()
+    with torch.no_grad():
+        train_loss = calc_loss_loader(train_loader, model, eval_iter)
+        val_loss = calc_loss_loader(val_loader, model, eval_iter)
+    model.train()
+    return train_loss, val_loss
+
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+
+def plot_losses(epochs_seen, tokens_seen, train_losses, val_losses):
+    fig, ax1 = plt.subplots(figsize=(5, 3))
+
+    # Plot training and validation loss against epochs
+    ax1.plot(epochs_seen, train_losses, label="Training loss")
+    ax1.plot(epochs_seen, val_losses, linestyle="-.", label="Validation loss")
+    ax1.set_xlabel("Epochs")
+    ax1.set_ylabel("Loss")
+    ax1.legend(loc="upper right")
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True))  # only show integer labels on x-axis
+
+    # Create a second x-axis for tokens seen
+    ax2 = ax1.twiny()  # Create a second x-axis that shares the same y-axis
+    ax2.plot(tokens_seen, train_losses, alpha=0)  # Invisible plot for aligning ticks
+    ax2.set_xlabel("Tokens seen")
+
+    fig.tight_layout()  # Adjust layout to make room
+    plt.savefig("loss-plot.pdf")
+    plt.show()
